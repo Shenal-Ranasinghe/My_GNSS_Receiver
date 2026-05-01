@@ -22,10 +22,11 @@ except Exception:
     print("matplotlib not found. Will run in console mode only.")
 
 
-ACQ_RE = re.compile(r"Successful acquisition.*for satellite .*?(?:G |GPS PRN )?(\d+)")
-TRACK_START_RE = re.compile(r"Tracking of .* started .* for satellite .*?(?:G |GPS PRN )?(\d+)")
-PULLIN_RE = re.compile(r"Pull-in: .*?for satellite .*?(?:G |GPS PRN )?(\d+)")
-LOSS_RE = re.compile(r"Loss of lock .* satellite .*?(?:G |GPS PRN )?(\d+)")
+# Robust regexes for new and old GNSS-SDR log formats
+ACQ_RE = re.compile(r"(?:Successful|positive) acquisition.*?(?:for satellite|satellite) .*?(?:G |GPS PRN )?(\d+).*?channel (\d+)", re.IGNORECASE)
+TRACK_START_RE = re.compile(r"Tracking of .*?(?:for satellite|satellite)? .*?(?:G |GPS PRN )?(\d+).*?started.*?channel (\d+)", re.IGNORECASE)
+PULLIN_RE = re.compile(r"Pull-in.*?for satellite .*?(?:G |GPS PRN )?(\d+).*?channel (\d+)", re.IGNORECASE)
+LOSS_RE = re.compile(r"Loss of lock.*?channel (\d+)(?:.*?satellite .*?(?:G |GPS PRN )?(\d+))?", re.IGNORECASE)
 
 
 def find_latest_logdir():
@@ -40,7 +41,6 @@ def find_latest_logdir():
 
 def follow_file(path, callback, stop_event):
     # Robust file follower: reopens if file rotated or truncated.
-    # This will block until the file exists, then follow new lines.
     while not stop_event.is_set():
         try:
             with open(path, "r", errors="ignore") as f:
@@ -61,10 +61,8 @@ def follow_file(path, callback, stop_event):
                     try:
                         st = os.stat(path)
                         if inode is not None and st.st_ino != inode:
-                            # file rotated; break to reopen
                             break
                         if st.st_size < f.tell():
-                            # truncated
                             f.seek(0)
                             buf = ""
                     except FileNotFoundError:
@@ -85,6 +83,7 @@ class Dashboard:
         self.tracking = set()
         self.locked = set()
         self.lost = set()
+        self.channel_map = {}  # channel -> prn mapping
         self.prn_history = defaultdict(lambda: deque(maxlen=10))
         self.pos = None
         self.iio_overflow_count = 0
@@ -93,6 +92,7 @@ class Dashboard:
         self.last_log_time = None
         self.log_inode = None
         if logdir:
+            # Find the actual .log file or .INFO symlink
             symlink_path = os.path.join(logdir, 'gnss-sdr.INFO')
             if os.path.islink(symlink_path):
                 target = os.readlink(symlink_path)
@@ -101,13 +101,11 @@ class Dashboard:
                 if os.path.exists(target):
                     self.logfile = target
             if not self.logfile:
-                logfiles = []
-                for f in os.listdir(logdir):
-                    path = os.path.join(logdir, f)
-                    if os.path.isfile(path) and '.log' in f:
-                        logfiles.append(path)
+                logfiles = [os.path.join(logdir, f) for f in os.listdir(logdir) if '.log' in f]
                 logfiles.sort(key=os.path.getmtime, reverse=True)
                 self.logfile = logfiles[0] if logfiles else None
+
+            # NMEA and GPX search (initial check)
             nmea = os.path.join(logdir, 'gnss_sdr_pvt.nmea')
             if os.path.exists(nmea):
                 self.nmea_file = nmea
@@ -115,121 +113,107 @@ class Dashboard:
             if gpx_candidates:
                 gpx_candidates.sort(key=os.path.getmtime, reverse=True)
                 self.gpx_file = gpx_candidates[0]
-            # record logfile inode and mtime if available
-            if self.logfile and os.path.exists(self.logfile):
-                try:
-                    st = os.stat(self.logfile)
-                    self.log_inode = st.st_ino
-                    self.last_log_time = st.st_mtime
-                except Exception:
-                    pass
 
     def process_log_line(self, line):
-        # detect IIO overflow warnings
         if 'overflow' in line.lower():
             with self.lock:
                 self.iio_overflow_count += 1
                 self.last_overflow_time = time.time()
-            # continue processing other events too
-        # detect a new GNSS-SDR run / flowgraph start and reset state
-        if 'Log file created' in line or 'Flowgraph connected' in line or 'Flowgraph started' in line:
-            with self.lock:
-                self.acquired.clear()
-                self.tracking.clear()
-                self.locked.clear()
-                self.lost.clear()
-                self.prn_history.clear()
-                self.pos = None
-                self.iio_overflow_count = 0
-                self.last_overflow_time = None
-            return
-        # update last activity time
-        try:
-            self.last_log_time = time.time()
-        except Exception:
-            pass
         
-        p = PULLIN_RE.search(line)
-        if p:
-            prn = p.group(1)
+        if any(msg in line for msg in ['Log file created', 'Flowgraph connected', 'Flowgraph started']):
             with self.lock:
-                self.locked.add(prn)
-                self.tracking.add(prn)
-                self.acquired.discard(prn)
-                self.lost.discard(prn)
-                self.prn_history[prn].append(('lock', time.time()))
+                self.acquired.clear(); self.tracking.clear(); self.locked.clear(); self.lost.clear()
+                self.channel_map.clear(); self.prn_history.clear(); self.pos = None
+                self.iio_overflow_count = 0; self.last_overflow_time = None
             return
+
+        self.last_log_time = time.time()
+        
+        # Parsing with channel awareness
         a = ACQ_RE.search(line)
         if a:
-            prn = a.group(1)
+            prn, ch = a.groups()
             with self.lock:
+                self.channel_map[ch] = prn
                 if prn not in self.tracking and prn not in self.locked:
                     self.acquired.add(prn)
                 self.prn_history[prn].append(('acq', time.time()))
             return
+
         t = TRACK_START_RE.search(line)
         if t:
-            prn = t.group(1)
+            prn, ch = t.groups()
             with self.lock:
+                self.channel_map[ch] = prn
                 self.tracking.add(prn)
                 self.acquired.discard(prn)
                 self.lost.discard(prn)
                 self.prn_history[prn].append(('trk', time.time()))
             return
+
+        p = PULLIN_RE.search(line)
+        if p:
+            prn, ch = p.groups()
+            with self.lock:
+                self.channel_map[ch] = prn
+                self.locked.add(prn); self.tracking.add(prn)
+                self.acquired.discard(prn); self.lost.discard(prn)
+                self.prn_history[prn].append(('lock', time.time()))
+            return
+
         l = LOSS_RE.search(line)
         if l:
-            prn = l.group(1)
+            ch = l.group(1)
+            prn = l.group(2) if len(l.groups()) > 1 else None
             with self.lock:
-                self.tracking.discard(prn)
-                self.locked.discard(prn)
-                self.acquired.discard(prn)
-                self.lost.add(prn)
-                self.prn_history[prn].append(('loss', time.time()))
+                if prn is None:
+                    prn = self.channel_map.get(ch)
+                if prn:
+                    self.tracking.discard(prn); self.locked.discard(prn)
+                    self.acquired.discard(prn); self.lost.add(prn)
+                    self.prn_history[prn].append(('loss', time.time()))
             return
 
     def process_nmea_line(self, line):
-        # quick GGA parser: $--GGA,hhmmss.ss,lat,NS,lon,EW,fix, ...
-        if not line.startswith('$'):
-            return
+        if not line.startswith('$'): return
         parts = line.split(',')
-        if len(parts) < 6:
-            return
+        if len(parts) < 6: return
         if parts[0].endswith('GGA'):
             try:
-                lat_raw = parts[2]
-                lat_dir = parts[3]
-                lon_raw = parts[4]
-                lon_dir = parts[5]
+                lat_raw, lat_dir, lon_raw, lon_dir = parts[2], parts[3], parts[4], parts[5]
                 if lat_raw and lon_raw:
                     lat = float(lat_raw[:2]) + float(lat_raw[2:]) / 60.0
-                    if lat_dir == 'S':
-                        lat = -lat
+                    if lat_dir == 'S': lat = -lat
                     lon = float(lon_raw[:3]) + float(lon_raw[3:]) / 60.0
-                    if lon_dir == 'W':
-                        lon = -lon
-                    with self.lock:
-                        self.pos = (lat, lon)
-            except Exception:
-                pass
+                    if lon_dir == 'W': lon = -lon
+                    with self.lock: self.pos = (lat, lon)
+            except Exception: pass
 
     def process_gpx_file(self):
-        if not self.gpx_file:
-            return
+        if not self.gpx_file: return
         try:
             import xml.etree.ElementTree as ET
             tree = ET.parse(self.gpx_file)
             root = tree.getroot()
             namespace = {'gpx': 'http://www.topografix.com/GPX/1/1'}
             trkpts = root.findall('.//gpx:trkpt', namespace)
-            if not trkpts:
-                return
-            last = trkpts[-1]
-            lat = float(last.attrib['lat'])
-            lon = float(last.attrib['lon'])
-            with self.lock:
-                self.pos = (lat, lon)
-        except Exception:
-            pass
+            if trkpts:
+                last = trkpts[-1]
+                with self.lock: self.pos = (float(last.attrib['lat']), float(last.attrib['lon']))
+        except Exception: pass
+
+    def _wait_for_nmea(self, stop_ev):
+        """Thread to continuously look for the NMEA file if it doesn't exist yet."""
+        while not stop_ev.is_set():
+            if not self.nmea_file:
+                nmea = os.path.join(self.logdir, 'gnss_sdr_pvt.nmea')
+                if os.path.exists(nmea):
+                    with self.lock:
+                        self.nmea_file = nmea
+                    print(f'\n[INFO] NMEA file detected: {nmea}. Starting position monitor.')
+                    threading.Thread(target=follow_file, args=(self.nmea_file, self.process_nmea_line, stop_ev), daemon=True).start()
+                    break
+            time.sleep(2)
 
     def start(self):
         stop_ev = threading.Event()
@@ -238,14 +222,16 @@ class Dashboard:
             print('Monitoring log file:', self.logfile)
             t = threading.Thread(target=follow_file, args=(self.logfile, self.process_log_line, stop_ev), daemon=True)
             t.start(); threads.append(t)
-        else:
-            print('No log file found in', self.logdir)
+        
+        # NMEA background waiter
+        t_nmea = threading.Thread(target=self._wait_for_nmea, args=(stop_ev,), daemon=True)
+        t_nmea.start(); threads.append(t_nmea)
+        
         if self.nmea_file:
             print('Monitoring NMEA file:', self.nmea_file)
             t2 = threading.Thread(target=follow_file, args=(self.nmea_file, self.process_nmea_line, stop_ev), daemon=True)
             t2.start(); threads.append(t2)
-        else:
-            print('No NMEA file found in', self.logdir)
+
         if self.gpx_file:
             print('Using GPX fallback:', self.gpx_file)
             self.process_gpx_file()

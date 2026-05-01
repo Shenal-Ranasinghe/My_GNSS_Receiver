@@ -15,16 +15,16 @@ mkdir -p "$LOGDIR"
 echo "Using config: $CONFIG"
 echo "Log dir: $LOGDIR"
 
-GNSS_SDR_BIN="$ROOT_DIR/build/src/main/gnss-sdr"
+GNSS_SDR_BIN="/usr/local/bin/gnss-sdr"
 if [ ! -x "$GNSS_SDR_BIN" ]; then
-  echo "gnss-sdr binary not found at $GNSS_SDR_BIN. Build first: cd $ROOT_DIR && mkdir -p build && cd build && cmake .. && make -j"
+  echo "gnss-sdr binary not found at $GNSS_SDR_BIN. Please install it using 'sudo apt install gnss-sdr'."
   exit 1
 fi
 
 echo "Starting gnss-sdr for BladeRF (press Ctrl-C to stop) ..."
 # Explicitly turn on Bias-Tee on RX1 for the active antenna
 echo "Enabling BladeRF Bias-Tee on RX1..."
-bladeRF-cli -e "set biastee rx1 on"
+bladeRF-cli -d "*:serial=0eecd0f37bd54ac8acd1aca9a37c080b" -e "set biastee rx1 on"
 cd "$LOGDIR"
 "$GNSS_SDR_BIN" --config_file="$CONFIG" --log_dir="$LOGDIR" -alsologtostderr
 
